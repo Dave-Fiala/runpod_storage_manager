@@ -1,0 +1,23 @@
+[project]
+name = "runpod-storage-manager"
+version = "0.1.0"
+description = "Visual tool to help manage RunPod storage volumes"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+dependencies = [
+    "PyQt6>=6.7",
+    "keyring>=25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
