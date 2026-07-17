@@ -13,16 +13,16 @@ import sys
 
 from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
-from .controller.connection_controller import ConnectionController
-from .model.config_store import ConfigStore
-from .model.connection_profile import ConnectionProfile
-from .model.credentials_store import CredentialsStore
-from .model.mount_state import MountState
-from .services.component_checker import ComponentChecker
-from .services.component_installer import ComponentInstaller
-from .services.windows_mount_service import WindowsMountService
-from .view.connection_widget import ConnectionWidget
-from .view.setup_dialog import SetupDialog
+from connection_manager.controller.connection_controller import ConnectionController
+from connection_manager.model.config_store import ConfigStore
+from connection_manager.model.connection_profile import ConnectionProfile
+from connection_manager.model.credentials_store import CredentialsStore
+from connection_manager.model.mount_state import MountState
+from connection_manager.services.component_checker import ComponentChecker
+from connection_manager.services.component_installer import ComponentInstaller
+from connection_manager.services.windows_mount_service import WindowsMountService
+from connection_manager.view.connection_widget import ConnectionWidget
+from connection_manager.view.setup_dialog import SetupDialog
 
 logger = logging.getLogger(__name__)
 
