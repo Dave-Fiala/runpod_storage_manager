@@ -1,27 +1,19 @@
 """
-comfy_model_extractor.py
+workflow_scanner.py
 
-Scans a ComfyUI workflow (.json) export and extracts every reference to a
-file that lives under ComfyUI's `models/` directory tree (checkpoints,
-diffusion_models/unet, text_encoders/clip, vae, loras, controlnet,
-upscale_models, clip_vision, style_models, gligen, photomaker, ipadapter,
-etc.), returning a list of `ModelRef` dataclass instances.
+Refactor of the ``comfy_model_extractor.py`` prototype into a pure-parse
+service. ``WorkflowScanner`` takes already-parsed workflow JSON (a ``dict``) and
+returns ``ModelRef`` parse results. It performs **no filesystem access** — all
+location/size resolution is the responsibility of ``WorkspacePool`` (see
+``model/workspace_pool.py``). Decoupling from IO lets the same code parse both
+local files and remote-only workflows fetched via the S3 API.
 
-Handles:
-- Top-level `nodes`
-- ComfyUI "subgraph" nodes (a node whose `type` is a UUID pointing into
-  `definitions.subgraphs`) by recursing into the subgraph's own `nodes`.
-- Known loader node types via a registry (so we know which widget index(es)
-  hold the filename).
-- Unknown/custom loader nodes via a fallback heuristic that scans all
-  widget values for strings ending in a known model file extension.
-- Resolving on-disk path + file size, if a models directory is supplied.
+The node registry, fallback heuristic, subgraph recursion, and de-dupe logic
+are carried over verbatim from the prototype.
 """
-
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -61,27 +53,29 @@ MODEL_NODE_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 # Node types that legitimately load "*Loader"-style files but are NOT model
-# files (images, videos, etc). Used to keep the fallback heuristic from
-# misfiring on things like LoadImage.
+# files (images, videos, etc). Keeps the fallback heuristic from misfiring.
 NON_MODEL_LOADER_TYPES = {
     "LoadImage", "LoadImageMask", "LoadImageOutput", "VHS_LoadVideo",
     "VHS_LoadVideoPath", "LoadAudio",
 }
 
 
+class WorkflowParseError(Exception):
+    """Raised when a workflow JSON is malformed or missing required structure."""
+
+
 @dataclass
 class ModelRef:
+    """A pure parse result: no location/size fields — the pool resolves those."""
+
     node_id: Any
     node_type: str
     node_title: Optional[str]
-    category: str                 # checkpoint / diffusion_model / text_encoder / vae / lora / controlnet / ...
-    filename: str                 # e.g. "flux-2-klein-9b-fp8.safetensors"
-    subfolder: str                # guessed ComfyUI models subfolder, e.g. "diffusion_models"
-    subgraph_path: str            # "" if in the main graph, else e.g. "SAMPLER"
-    resolved_path: Optional[str]  # absolute path if a models_dir was supplied
-    exists_on_disk: bool
-    size_bytes: Optional[int]
-    extra: dict = field(default_factory=dict)  # e.g. {"strength_model": 0.7}
+    category: str
+    filename: str
+    subfolder: str
+    subgraph_path: str = ""
+    extra: dict = field(default_factory=dict)
 
 
 def _iter_all_nodes(nodes: list[dict], subgraph_defs: dict[str, dict], path: str = ""):
@@ -144,7 +138,7 @@ def _extract_from_node(node: dict, subgraph_path: str) -> list[ModelRef]:
         subfolder = registry_entry["subfolder"]
         for idx in registry_entry["filename_widgets"]:
             if idx < len(widgets) and isinstance(widgets[idx], str) and widgets[idx]:
-                extra = {}
+                extra: dict = {}
                 # Grab common trailing numeric widgets (e.g. LoRA strength) as metadata.
                 trailing = widgets[len(registry_entry["filename_widgets"]):]
                 if node_type in ("LoraLoader", "LoraLoaderModelOnly", "LoraLoaderGGUF") and trailing:
@@ -160,16 +154,13 @@ def _extract_from_node(node: dict, subgraph_path: str) -> list[ModelRef]:
                         filename=widgets[idx],
                         subfolder=subfolder,
                         subgraph_path=subgraph_path,
-                        resolved_path=None,
-                        exists_on_disk=False,
-                        size_bytes=None,
                         extra=extra,
                     )
                 )
         return results
 
-    # Fallback: unknown node type. Only consider it if it smells like a
-    # loader and isn't explicitly excluded, then scan widgets for filenames.
+    # Fallback: unknown node type. Only consider it if it smells like a loader
+    # and isn't explicitly excluded, then scan widgets for filenames.
     if node_type in NON_MODEL_LOADER_TYPES:
         return results
 
@@ -186,83 +177,75 @@ def _extract_from_node(node: dict, subgraph_path: str) -> list[ModelRef]:
                         filename=val,
                         subfolder=subfolder,
                         subgraph_path=subgraph_path,
-                        resolved_path=None,
-                        exists_on_disk=False,
-                        size_bytes=None,
                         extra={"detected_via": "fallback_extension_scan"},
                     )
                 )
     return results
 
 
-def extract_models_from_workflow(
-    workflow_json_path: str,
-    models_dir: Optional[str] = None,
-) -> list[ModelRef]:
+class WorkflowScanner:
+    """Parses ComfyUI workflow JSON into a list of ``ModelRef`` parse results.
+
+    Stateless and filesystem-free: pass parsed JSON to :meth:`extract`, or use
+    the :meth:`extract_from_file` convenience for local files.
     """
-    Parse a ComfyUI workflow JSON file and return a list of ModelRef objects
-    describing every checkpoint / diffusion model / clip / vae / lora /
-    controlnet / etc. referenced anywhere in the graph (including inside
-    subgraphs).
 
-    Args:
-        workflow_json_path: path to the exported ComfyUI workflow .json file.
-        models_dir: optional path to a local ComfyUI `models/` directory.
-            If given, each ModelRef's `resolved_path`, `exists_on_disk`, and
-            `size_bytes` will be filled in by looking for
-            `<models_dir>/<subfolder>/<filename>`.
+    def extract(self, workflow_json: dict) -> list[ModelRef]:
+        """Return every model reference found in the graph (incl. subgraphs).
 
-    Returns:
-        List[ModelRef]
-    """
-    with open(workflow_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        Raises:
+            WorkflowParseError: if the JSON lacks the expected ``nodes`` array.
+        """
+        if not isinstance(workflow_json, dict):
+            raise WorkflowParseError("Workflow JSON root is not an object.")
+        if "nodes" not in workflow_json:
+            raise WorkflowParseError("Workflow JSON has no 'nodes' array.")
 
-    nodes = data.get("nodes", [])
-    subgraph_defs = {sg["id"]: sg for sg in data.get("definitions", {}).get("subgraphs", [])}
+        nodes = workflow_json.get("nodes") or []
+        subgraph_defs = {
+            sg["id"]: sg
+            for sg in workflow_json.get("definitions", {}).get("subgraphs", [])
+            if isinstance(sg, dict) and "id" in sg
+        }
 
-    models: list[ModelRef] = []
-    seen = set()  # de-dupe identical (node_id, filename) pairs across traversal quirks
+        models: list[ModelRef] = []
+        seen: set[tuple] = set()  # de-dupe (node_id, subgraph_path, filename)
 
-    for node, subgraph_path in _iter_all_nodes(nodes, subgraph_defs):
-        for ref in _extract_from_node(node, subgraph_path):
-            key = (ref.node_id, ref.subgraph_path, ref.filename)
-            if key in seen:
-                continue
-            seen.add(key)
-            models.append(ref)
+        for node, subgraph_path in _iter_all_nodes(nodes, subgraph_defs):
+            for ref in _extract_from_node(node, subgraph_path):
+                dedupe_key = (ref.node_id, ref.subgraph_path, ref.filename)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                models.append(ref)
 
-    if models_dir:
-        for ref in models:
-            candidate = os.path.join(models_dir, ref.subfolder, ref.filename)
-            ref.resolved_path = candidate
-            if os.path.isfile(candidate):
-                ref.exists_on_disk = True
-                ref.size_bytes = os.path.getsize(candidate)
-            else:
-                ref.exists_on_disk = False
-                ref.size_bytes = None
+        return models
 
-    return models
+    def extract_from_file(self, workflow_json_path: str) -> list[ModelRef]:
+        """Read a local workflow JSON file and extract its model references."""
+        try:
+            with open(workflow_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise WorkflowParseError(f"Invalid JSON: {exc}") from exc
+        except OSError as exc:
+            raise WorkflowParseError(f"Could not read workflow file: {exc}") from exc
+        return self.extract(data)
 
 
 if __name__ == "__main__":
     import sys
 
     path = sys.argv[1] if len(sys.argv) > 1 else "260615_MICKMUMPITZ_FLUX_KLEIN_9B_V01.json"
-    models_dir_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    scanner = WorkflowScanner()
+    refs = scanner.extract_from_file(path)
 
-    results = extract_models_from_workflow(path, models_dir=models_dir_arg)
-
-    print(f"Found {len(results)} model reference(s):\n")
-    for m in results:
+    print(f"Found {len(refs)} model reference(s):\n")
+    for m in refs:
         loc = f" (subgraph: {m.subgraph_path})" if m.subgraph_path else ""
-        size = f"{m.size_bytes:,} bytes" if m.size_bytes is not None else "size unknown"
         print(f"- [{m.category}] {m.filename}{loc}")
         print(f"    node: {m.node_type} (id={m.node_id}, title={m.node_title!r})")
         print(f"    models/{m.subfolder}/{m.filename}")
-        if m.resolved_path:
-            print(f"    resolved: {m.resolved_path} | exists={m.exists_on_disk} | {size}")
         if m.extra:
             print(f"    extra: {m.extra}")
         print()
