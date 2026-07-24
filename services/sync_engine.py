@@ -15,12 +15,14 @@ iff no *other* remote-existing workflow links it.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
 from model.entities import Location
 from model.workspace_pool import WorkspacePool
+from services.remote_storage import upload_part_count
 from viewmodels import JobReportVM
 
 logger = logging.getLogger(__name__)
@@ -160,39 +162,66 @@ class SyncEngine:
         return RemovePlan(workflow_key, delete, retained, reclaimed)
 
     # -------------------------------------------------------------- execute
+    @staticmethod
+    def _transfer_part_count(item: TransferItem) -> int:
+        """Parts for one upload item, using on-disk size when available."""
+        if item.local_path and os.path.isfile(item.local_path):
+            size = os.path.getsize(item.local_path)
+        else:
+            size = item.size_bytes
+        return upload_part_count(size)
+
     def execute_sync(self, plan: SyncPlan, remote, ctx) -> JobReportVM:
-        total = plan.total_bytes or 1
-        done = 0
+        n = len(plan.uploads)
+        total_parts = sum(self._transfer_part_count(item) for item in plan.uploads) or 1
+        parts_done = 0
         succeeded = 0
         failures: list[tuple[str, str]] = []
-        n = len(plan.uploads)
+
+        ctx.progress(0, total_parts, f"Preparing upload ({total_parts} parts)")
 
         for i, item in enumerate(plan.uploads, start=1):
             if ctx.cancelled:
                 failures.append((item.display_name, "cancelled"))
                 continue
+            item_parts = self._transfer_part_count(item)
+            parts_at_item_start = parts_done
             ctx.status(f"Uploading {i}/{n}: {item.display_name}")
-            base = done
 
-            def cb(inc: int, _base=base, _item=item, _i=i) -> None:
-                nonlocal done
-                done += inc
-                ctx.progress(done, total,
-                             f"Uploading {_i}/{n}: {_item.display_name}")
+            def cb(
+                _inc: int,
+                _start=parts_at_item_start,
+                _parts=item_parts,
+                _item=item,
+                _i=i,
+            ) -> None:
+                nonlocal parts_done
+                parts_done = min(_start + _parts, parts_done + 1)
+                ctx.progress(
+                    parts_done,
+                    total_parts,
+                    f"Uploading {_i}/{n}: {_item.display_name} "
+                    f"({parts_done}/{total_parts} parts)",
+                )
 
             try:
                 remote.upload_file(item.local_path, item.remote_key, cb, ctx.cancel_token)
                 self._mark_uploaded(item)
                 succeeded += 1
-                done = base + item.size_bytes
-                ctx.progress(done, total, f"Uploaded {i}/{n}: {item.display_name}")
+                parts_done = parts_at_item_start + item_parts
+                ctx.progress(
+                    parts_done,
+                    total_parts,
+                    f"Uploaded {i}/{n}: {item.display_name}",
+                )
             except Exception as exc:  # noqa: BLE001
                 if ctx.cancelled:
                     failures.append((item.display_name, "cancelled"))
                     break
                 logger.exception("Upload failed for %s", item.remote_key)
                 failures.append((item.display_name, str(exc)))
-                done = base + item.size_bytes  # advance bar past the failed item
+                parts_done = parts_at_item_start + item_parts
+                ctx.progress(parts_done, total_parts, f"Failed {i}/{n}: {item.display_name}")
 
         msg = f"Uploaded {succeeded} item(s)."
         if failures:

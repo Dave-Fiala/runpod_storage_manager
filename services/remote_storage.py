@@ -56,6 +56,16 @@ _RETRY_MAX_DELAY = 60.0          # seconds; backoff ceiling
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527})
 
 
+def upload_part_count(size_bytes: int) -> int:
+    """Return the number of S3 upload steps (PutObject or UploadPart) for a file.
+
+    Kept in sync with ``RemoteStorageService.upload_file`` so the sync engine can
+    pre-compute total progress steps before any bytes move."""
+    if size_bytes < _MULTIPART_THRESHOLD:
+        return 1
+    return max(1, (size_bytes + _MULTIPART_PART_SIZE - 1) // _MULTIPART_PART_SIZE)
+
+
 class RemoteStorageError(Exception):
     pass
 

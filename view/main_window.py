@@ -371,6 +371,9 @@ class MainWindow(QMainWindow):
     def on_job_started(self, kind: str, description: str) -> None:
         if kind in ("sync", "remove"):
             self._cancel_button.setVisible(True)
+            bar = self.ui.progressBar_MainProgress
+            bar.setRange(0, 100)
+            bar.setValue(0)
 
     def on_job_finished(self, report: JobReportVM) -> None:
         self._cancel_button.setVisible(False)

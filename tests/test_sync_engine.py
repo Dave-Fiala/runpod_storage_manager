@@ -1,10 +1,12 @@
 """Table-driven tests for SyncEngine plan logic (skip + shared-model protection)."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from model.entities import Location
 from model.workflow_scanner import ModelRef
 from model.workspace_pool import WorkspacePool
-from services.sync_engine import SyncEngine
+from services.sync_engine import Direction, SyncEngine, SyncPlan, TransferItem
 
 
 def _ref(filename, subfolder="checkpoints", category="checkpoint", node_id=1):
@@ -97,3 +99,68 @@ def test_plan_remove_deletes_all_when_not_shared(qapp):
     assert {i.display_name for i in plan.delete} == {"x.safetensors", "solo.json"}
     assert not plan.retained_shared
     assert plan.reclaimed_bytes == 42
+
+
+@dataclass
+class _FakeCtx:
+    cancel_token: object = None
+    progress_calls: list[tuple[int, int, str]] = field(default_factory=list)
+    status_calls: list[str] = field(default_factory=list)
+
+    @property
+    def cancelled(self) -> bool:
+        return False
+
+    def progress(self, done: int, total: int, message: str = "") -> None:
+        self.progress_calls.append((done, total, message))
+
+    def status(self, message: str) -> None:
+        self.status_calls.append(message)
+
+
+class _FakeRemote:
+    def __init__(self) -> None:
+        self.uploads: list[tuple[str, str]] = []
+
+    def upload_file(self, local_path, key, progress_cb=None, cancel_token=None) -> None:
+        self.uploads.append((local_path, key))
+        if progress_cb is not None:
+            # Simulate two multipart parts regardless of file size.
+            progress_cb(1)
+            progress_cb(1)
+
+
+def test_execute_sync_reports_part_progress(qapp, tmp_path):
+    pool = WorkspacePool()
+    pool.upsert_workflow(filename="wf.json", location=Location.LOCAL,
+                         local_path=str(tmp_path / "wf.json"))
+    wf_key = next(iter(pool.workflows))
+    (tmp_path / "wf.json").write_text("{}")
+
+    big = tmp_path / "big.safetensors"
+    big.write_bytes(b"x" * (17 * 1024 * 1024))  # 2 upload parts at 16 MB threshold
+    small = tmp_path / "small.json"
+    small.write_bytes(b"{}")
+
+    plan = SyncPlan(
+        workflow_key=wf_key,
+        direction=Direction.PUSH,
+        uploads=[
+            TransferItem("big.safetensors", "models/big.safetensors", big.stat().st_size,
+                         local_path=str(big)),
+            TransferItem("small.json", "workflows/small.json", small.stat().st_size,
+                         local_path=str(small)),
+        ],
+        skips=[],
+        total_bytes=big.stat().st_size + small.stat().st_size,
+    )
+
+    engine = SyncEngine(pool)
+    ctx = _FakeCtx()
+    engine.execute_sync(plan, _FakeRemote(), ctx)
+
+    totals = {total for _done, total, _msg in ctx.progress_calls}
+    assert totals == {3}  # 2 parts + 1 single-part file
+    assert ctx.progress_calls[0][0] == 0
+    assert ctx.progress_calls[-1][0] == 3
+    assert ctx.progress_calls[-1][1] == 3

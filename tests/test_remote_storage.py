@@ -10,7 +10,7 @@ import pytest
 moto = pytest.importorskip("moto")
 from moto import mock_aws  # noqa: E402
 
-from services.remote_storage import RemoteStorageService  # noqa: E402
+from services.remote_storage import RemoteStorageService, upload_part_count  # noqa: E402
 
 _BUCKET = "vol-test-123"
 _REGION = "us-east-1"
@@ -158,6 +158,16 @@ def test_upload_part_retries_on_524(tmp_path, monkeypatch):
     assert calls["n"] == 2  # failed once, retried, succeeded
     body = svc.head_object("models/flaky.bin")
     assert body is not None
+
+
+def test_upload_part_count():
+    part = 16 * 1024 * 1024
+    assert upload_part_count(0) == 1
+    assert upload_part_count(1024) == 1
+    assert upload_part_count(part - 1) == 1
+    assert upload_part_count(part) == 1
+    assert upload_part_count(part + 1) == 2
+    assert upload_part_count(part * 3 + 1000) == 4
 
 
 @mock_aws
