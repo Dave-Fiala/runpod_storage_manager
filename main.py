@@ -62,6 +62,14 @@ def _wire_controller_to_view(controller: SyncController, window: MainWindow) -> 
     controller.activeWorkflowSelected.connect(window.set_active_key)
 
 
+def _wire_connection_usage(conn_widget, controller: SyncController) -> None:
+    conn_widget.refreshUsageRequested.connect(controller.on_refresh_usage_requested)
+    controller.usageScanStarted.connect(conn_widget.on_usage_scan_started)
+    controller.usageScanProgress.connect(conn_widget.on_usage_scan_progress)
+    controller.usageScanFinished.connect(conn_widget.on_usage_scan_finished)
+    controller.usageScanDeferred.connect(conn_widget.on_usage_deferred)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -102,6 +110,7 @@ def main() -> None:
 
     _wire_view_to_controller(window, controller)
     _wire_controller_to_view(controller, window)
+    _wire_connection_usage(conn_widget, controller)
     conn_controller.stateChanged.connect(controller.on_connection_state_changed)
 
     # -- restore persisted UI state -----------------------------------------

@@ -79,6 +79,26 @@ def test_upload_list_head_download_delete(tmp_path):
 
 
 @mock_aws
+def test_bucket_usage_respects_prefix_and_progress():
+    client = _make_bucket()
+    client.put_object(Bucket=_BUCKET, Key="models/a.bin", Body=b"aaa")
+    client.put_object(Bucket=_BUCKET, Key="models/b.bin", Body=b"bb")
+    client.put_object(Bucket=_BUCKET, Key="other/c.bin", Body=b"c")
+    svc = RemoteStorageService(FakeProfile(), "rps_test")
+
+    progress: list[tuple[int, str]] = []
+    used, count = svc.bucket_usage(
+        "models/", progress_cb=lambda n, msg: progress.append((n, msg)),
+    )
+    assert used == 5 and count == 2
+    assert progress
+    assert progress[0][0] == 1
+
+    used_all, count_all = svc.bucket_usage("")
+    assert count_all == 3 and used_all == 6
+
+
+@mock_aws
 def test_list_skips_directory_markers():
     client = _make_bucket()
     svc = RemoteStorageService(FakeProfile(), "rps_test")

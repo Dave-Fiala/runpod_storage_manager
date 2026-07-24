@@ -175,12 +175,19 @@ class RemoteStorageService:
             raise self._auth_or_generic(exc) from exc
 
     # ------------------------------------------------------------------ usage
-    def bucket_usage(self, prefix: str = "") -> tuple[int, int]:
+    def bucket_usage(
+        self,
+        prefix: str = "",
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        progress_interval: int = 100,
+    ) -> tuple[int, int]:
         used = 0
         count = 0
         for obj in self.list_objects(prefix):
             used += obj.size_bytes
             count += 1
+            if progress_cb and (count == 1 or count % progress_interval == 0):
+                progress_cb(count, f"Reading usage ({count:,} objects)…")
         return used, count
 
     def capacity_bytes(self) -> Optional[int]:

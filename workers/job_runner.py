@@ -44,7 +44,7 @@ class CancelToken:
 
 @dataclass
 class Job:
-    kind: str  # "refresh" | "sync" | "remove" | "usage"
+    kind: str  # "refresh" | "sync" | "remove" | "usage" | "probe"
     fn: Callable[["JobContext"], Any]
     description: str = ""
     # Whether the queue-empty/idle signalling should reflect this as user-facing

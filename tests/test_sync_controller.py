@@ -98,3 +98,70 @@ def test_jobs_run_serially(qtbot, controller_env):
     # Two refresh jobs (models + workflows) should each complete.
     qtbot.waitUntil(lambda: len(finished) >= 2, timeout=8000)
     controller._jobs.shutdown()
+
+
+def test_usage_scan_deferred_without_prefix(controller_env):
+    controller, pool, models_dir, wf_dir = controller_env
+    deferred: list[str] = []
+    controller.usageScanDeferred.connect(deferred.append)
+    controller._connected = True
+    controller._remote = object()
+
+    controller._start_usage_scan()
+
+    assert len(deferred) == 1
+    assert "remote model path" in deferred[0].lower()
+    assert controller._usage_scan_pending is False
+
+
+def test_usage_scan_runs_with_prefix(qtbot, controller_env):
+    controller, pool, models_dir, wf_dir = controller_env
+    controller.start()
+    controller._config.update(remote_model_prefix="models")
+    controller._connected = True
+
+    class MockRemote:
+        def bucket_usage(self, prefix, progress_cb=None, progress_interval=100):
+            assert prefix == "models/"
+            if progress_cb:
+                progress_cb(1, "Reading usage (1 objects)…")
+            return 2048, 1
+
+    controller._remote = MockRemote()
+    finished: list[tuple[bool, str]] = []
+    controller.usageScanFinished.connect(lambda ok, d: finished.append((ok, d)))
+
+    controller._start_usage_scan()
+    assert controller._usage_scan_pending
+
+    qtbot.waitUntil(lambda: len(finished) >= 1, timeout=8000)
+    assert finished[0][0] is True
+    assert controller._remote_used_bytes == 2048
+    assert controller._usage_scan_pending is False
+    controller._jobs.shutdown()
+
+
+def test_probe_sets_connected_before_usage_completes(qtbot, controller_env):
+    from workers.job_runner import Job
+
+    controller, pool, models_dir, wf_dir = controller_env
+    controller.start()
+    controller._drive_letter = "Z"
+
+    class MockRemote:
+        def probe(self) -> None:
+            pass
+
+        def bucket_usage(self, prefix, progress_cb=None, progress_interval=100):
+            return 0, 0
+
+    controller._remote = MockRemote()
+
+    def probe_job(ctx):
+        controller._remote.probe()
+        return True
+
+    controller._jobs.submit(Job(kind="probe", fn=probe_job, description="test probe", silent=True))
+    qtbot.waitUntil(lambda: controller._connected, timeout=8000)
+    assert controller._connected is True
+    controller._jobs.shutdown()

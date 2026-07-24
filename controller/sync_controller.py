@@ -77,6 +77,10 @@ class SyncController(QObject):
     removePlanReady = pyqtSignal(object)  # RemovePlanVM
     modelInfoReady = pyqtSignal(str, list)  # title, list[ModelInfoRowVM]
     activeWorkflowSelected = pyqtSignal(str)
+    usageScanStarted = pyqtSignal(str)  # prefix
+    usageScanProgress = pyqtSignal(int, str)  # objects_seen, message
+    usageScanFinished = pyqtSignal(bool, str)  # success, detail
+    usageScanDeferred = pyqtSignal(str)  # reason
 
     def __init__(
         self,
@@ -104,6 +108,8 @@ class SyncController(QObject):
         self._drive_name: str = ""
         self._remote_total_bytes: Optional[int] = None
         self._remote_used_bytes: Optional[int] = None
+        self._usage_scan_pending = False
+        self._active_job_kind: str = ""
 
         # Debounce timers per path-kind.
         self._debouncers: dict[str, QTimer] = {}
@@ -116,8 +122,8 @@ class SyncController(QObject):
 
         # Wire job runner signals through to the view.
         self._jobs.jobProgress.connect(self.jobProgress)
-        self._jobs.jobStarted.connect(self.jobStarted)
-        self._jobs.jobStatus.connect(self.currentOperation)
+        self._jobs.jobStarted.connect(self._on_job_started)
+        self._jobs.jobStatus.connect(self._on_job_status)
         self._jobs.jobLog.connect(lambda msg: self._log.add_line(msg, source="sync"))
         self._jobs.jobFinished.connect(self._on_job_finished)
         self._jobs.jobFailed.connect(self._on_job_failed)
@@ -168,6 +174,8 @@ class SyncController(QObject):
             self._start_local_workflows_refresh(value)
         elif kind == "remote_model":
             self._start_remote_models_refresh(value)
+            if self._connected:
+                self._start_usage_scan()
         elif kind == "remote_workflow":
             self._start_remote_workflows_refresh(value)
 
@@ -342,17 +350,14 @@ class SyncController(QObject):
             self._remote = None
             return
 
-        # Probe S3 independently to light the "connection established" lamp,
-        # then refresh remote usage and (if persisted) remote prefixes.
+        # Probe S3 independently to light the "connection established" lamp.
+        # Usage enumeration is a separate, best-effort job (see _start_usage_scan).
         def job(ctx):
             ctx.status("Verifying S3 connection")
             self._remote.probe()
-            used, _count = self._remote.bucket_usage("")
-            total = self._remote.capacity_bytes()
-            return {"used": used, "total": total}
+            return True
 
-        self._jobs.submit(Job(kind="usage", fn=job, description="S3 probe", silent=True))
-        self._usage_timer.start()
+        self._jobs.submit(Job(kind="probe", fn=job, description="S3 probe", silent=True))
 
     def _teardown_remote_service(self) -> None:
         self._usage_timer.stop()
@@ -360,6 +365,9 @@ class SyncController(QObject):
         self._connected = False
         self._remote_used_bytes = None
         self._remote_total_bytes = None
+        if self._usage_scan_pending:
+            self._usage_scan_pending = False
+            self.usageScanFinished.emit(False, "Disconnected")
 
     def _active_profile(self):
         if self._conn is None:
@@ -373,6 +381,51 @@ class SyncController(QObject):
     def _active_drive_letter(self) -> Optional[str]:
         profile = self._active_profile()
         return profile.drive_letter if profile else None
+
+    def _usage_prefix(self) -> str:
+        return _norm_prefix(self._config.data.remote_model_prefix)
+
+    def on_refresh_usage_requested(self) -> None:
+        if not self._connected or self._remote is None:
+            return
+        prefix = self._usage_prefix()
+        if not prefix:
+            self.usageScanDeferred.emit(
+                "Set the remote model path on the main window to calculate usage."
+            )
+            return
+        if self._usage_scan_pending:
+            self.usageScanDeferred.emit("Usage scan already in progress.")
+            return
+        self._start_usage_scan()
+
+    def _start_usage_scan(self) -> None:
+        """Enumerate model-prefix usage; no-op if not connected or prefix unset."""
+        if not self._connected or self._remote is None:
+            return
+        prefix = self._usage_prefix()
+        if not prefix:
+            self.usageScanDeferred.emit(
+                "Set the remote model path on the main window to calculate usage."
+            )
+            return
+        if self._usage_scan_pending:
+            return
+
+        self._usage_scan_pending = True
+        capacity = self._profile_capacity_bytes()
+        self.usageScanStarted.emit(prefix)
+
+        def job(ctx):
+            def progress_cb(count: int, message: str) -> None:
+                self.usageScanProgress.emit(count, message)
+
+            used, _count = self._remote.bucket_usage(
+                prefix, progress_cb=progress_cb,
+            )
+            return {"used": used, "total": capacity}
+
+        self._jobs.submit(Job(kind="usage", fn=job, description="Remote usage", silent=True))
 
     # ============================================================ sync/remove
     def on_sync_requested(self, key: str) -> None:
@@ -479,15 +532,14 @@ class SyncController(QObject):
             self._reveal(model.local_path)
 
     def on_reveal_remote(self, model_key: str) -> None:
-        if not self._drive_letter:
-            return
-        model = self._pool.models.get(model_key)
-        if model is None:
-            return
-        prefix = _norm_prefix(self._config.data.remote_model_prefix)
-        rel = f"{model.subfolder}/{model.filename}".replace("/", "\\")
-        path = f"{self._drive_letter}:\\{prefix.replace('/', chr(92))}{rel}"
-        self._reveal(path)
+        # Remote reveal used to open the mounted drive in Explorer. Drive
+        # mounting is now disabled (all remote access goes through the S3 API),
+        # so there is no local path to reveal.
+        self._log.add(
+            "INFO", "sync",
+            "Reveal in Explorer is unavailable for remote files "
+            "(drive mounting is disabled; remote access is API-only).",
+        )
 
     @staticmethod
     def _reveal(path: str) -> None:
@@ -500,18 +552,38 @@ class SyncController(QObject):
             logger.exception("Reveal failed for %s", path)
 
     # ================================================================ job hooks
+    def _on_job_started(self, kind: str, description: str) -> None:
+        self._active_job_kind = kind
+        self.jobStarted.emit(kind, description)
+
+    def _on_job_status(self, message: str) -> None:
+        # Usage scan progress is shown in the Connection Manager, not the main window.
+        if self._active_job_kind == "usage":
+            return
+        self.currentOperation.emit(message)
+
     def _on_job_finished(self, kind: str, result) -> None:
-        if kind == "usage" and isinstance(result, dict):
+        self._active_job_kind = ""
+        if kind == "probe":
             self._connected = True
-            self._remote_used_bytes = result.get("used")
-            self._remote_total_bytes = result.get("total")
+            self._remote_total_bytes = self._profile_capacity_bytes()
+            self.currentOperation.emit("Idle")
+            self._log.add("INFO", "sync", "S3 connection verified.")
             self._emit_connection_status(drive_mounted=True)
-            # Auto-refresh remote prefixes persisted from a previous session.
+            self._usage_timer.start()
             data = self._config.data
             if data.remote_model_prefix:
                 self._start_remote_models_refresh(data.remote_model_prefix)
             if data.remote_workflow_prefix:
                 self._start_remote_workflows_refresh(data.remote_workflow_prefix)
+            self._start_usage_scan()
+        elif kind == "usage" and isinstance(result, dict):
+            self._usage_scan_pending = False
+            self._remote_used_bytes = result.get("used")
+            self._remote_total_bytes = result.get("total")
+            used_label = human_bytes(self._remote_used_bytes)
+            self.usageScanFinished.emit(True, f"{used_label} used in models prefix")
+            self._emit_connection_status(drive_mounted=True)
         elif kind in ("sync", "remove"):
             report = result if isinstance(result, JobReportVM) else JobReportVM(kind, 0, (), "")
             self.jobFinished.emit(report)
@@ -521,6 +593,22 @@ class SyncController(QObject):
         self._emit_all()
 
     def _on_job_failed(self, kind: str, error: str) -> None:
+        self._active_job_kind = ""
+        if kind == "probe":
+            self._log.add("ERROR", "sync", f"S3 probe failed: {error}")
+            self._teardown_remote_service()
+            self._drive_letter = None
+            self.currentOperation.emit("Idle")
+            self.jobFinished.emit(JobReportVM(kind, 0, ((kind, error),), error))
+            self._emit_connection_status(drive_mounted=False)
+            self._emit_all()
+            return
+        if kind == "usage":
+            self._usage_scan_pending = False
+            self._log.add("ERROR", "sync", f"Usage scan failed: {error}")
+            self.usageScanFinished.emit(False, error)
+            self._emit_enablement()
+            return
         self._log.add("ERROR", "sync", f"{kind} failed: {error}")
         self.jobFinished.emit(JobReportVM(kind, 0, ((kind, error),), error))
         self._emit_enablement()
@@ -529,15 +617,17 @@ class SyncController(QObject):
         self._emit_enablement()
 
     def _refresh_remote_usage(self) -> None:
-        if self._remote is None:
+        if self._remote is None or not self._connected:
             return
+        self._start_usage_scan()
 
-        def job(ctx):
-            used, _count = self._remote.bucket_usage("")
-            total = self._remote.capacity_bytes()
-            return {"used": used, "total": total}
-
-        self._jobs.submit(Job(kind="usage", fn=job, description="Remote usage", silent=True))
+    def _profile_capacity_bytes(self) -> Optional[int]:
+        """Total volume capacity in bytes, from the user-supplied profile size (GB)."""
+        profile = self._active_profile()
+        size_gb = getattr(profile, "remote_volume_size", 0) if profile else 0
+        if not size_gb or size_gb <= 0:
+            return None
+        return int(size_gb) * (1024 ** 3)
 
     # ================================================================ VM build
     def _emit_all(self) -> None:

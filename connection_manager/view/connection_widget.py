@@ -4,6 +4,7 @@ import os
 import string
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -33,6 +34,7 @@ class ConnectionWidget(QWidget):
     disconnectRequested = pyqtSignal()
     saveRequested = pyqtSignal(object, str)  # (ConnectionProfile, secret)
     profileSelected = pyqtSignal(str)  # profile name
+    refreshUsageRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -76,6 +78,11 @@ class ConnectionWidget(QWidget):
         self._volume_edit = QLineEdit()
         self._volume_edit.setPlaceholderText("Network volume ID (= bucket name)")
         details_layout.addRow("Volume ID:", self._volume_edit)
+
+        self._volume_size_edit = QLineEdit()
+        self._volume_size_edit.setValidator(QIntValidator(1, 1_000_000, self))
+        self._volume_size_edit.setPlaceholderText("Provisioned size in GB (e.g. 50)")
+        details_layout.addRow("Volume Size (GB):", self._volume_size_edit)
 
         self._access_key_edit = QLineEdit()
         self._access_key_edit.setPlaceholderText("user_...")
@@ -149,6 +156,24 @@ class ConnectionWidget(QWidget):
 
         layout.addLayout(status_layout)
 
+        # Volume usage scan (model-prefix scoped; progress shown here, not main window)
+        usage_layout = QHBoxLayout()
+        self._usage_label = QLabel("Volume usage: idle")
+        self._usage_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        usage_layout.addWidget(self._usage_label)
+
+        self._usage_progress_bar = QProgressBar()
+        self._usage_progress_bar.setMaximumWidth(150)
+        self._usage_progress_bar.setVisible(False)
+        usage_layout.addWidget(self._usage_progress_bar)
+
+        self._refresh_usage_btn = QPushButton("Refresh Usage")
+        self._refresh_usage_btn.setEnabled(False)
+        self._refresh_usage_btn.clicked.connect(self.refreshUsageRequested.emit)
+        usage_layout.addWidget(self._refresh_usage_btn)
+
+        layout.addLayout(usage_layout)
+
         # Log pane
         self._log_pane = QPlainTextEdit()
         self._log_pane.setReadOnly(True)
@@ -176,6 +201,7 @@ class ConnectionWidget(QWidget):
         self._region_combo.setEnabled(inputs_enabled)
         self._endpoint_edit.setEnabled(inputs_enabled)
         self._volume_edit.setEnabled(inputs_enabled)
+        self._volume_size_edit.setEnabled(inputs_enabled)
         self._access_key_edit.setEnabled(inputs_enabled)
         self._secret_edit.setEnabled(inputs_enabled)
         self._drive_combo.setEnabled(inputs_enabled)
@@ -184,6 +210,7 @@ class ConnectionWidget(QWidget):
 
         self._connect_btn.setEnabled(state in (MountState.DISCONNECTED, MountState.ERROR))
         self._disconnect_btn.setEnabled(state == MountState.MOUNTED)
+        self._refresh_usage_btn.setEnabled(state == MountState.MOUNTED)
 
         in_progress = state in (MountState.MOUNTING, MountState.UNMOUNTING)
         self._progress_bar.setVisible(in_progress)
@@ -214,6 +241,28 @@ class ConnectionWidget(QWidget):
 
         if state in (MountState.DISCONNECTED, MountState.ERROR):
             self._refresh_drive_letters()
+            self.on_usage_scan_finished(False, "Disconnected")
+
+    def on_usage_scan_started(self, prefix: str) -> None:
+        self._usage_progress_bar.setVisible(True)
+        self._usage_progress_bar.setRange(0, 0)
+        self._usage_label.setText(f"Scanning models prefix: {prefix}")
+
+    def on_usage_scan_progress(self, objects_seen: int, message: str) -> None:
+        self._usage_label.setText(message)
+
+    def on_usage_scan_finished(self, success: bool, detail: str = "") -> None:
+        self._usage_progress_bar.setVisible(False)
+        if success and detail:
+            self._usage_label.setText(f"Volume usage: {detail}")
+        elif detail:
+            self._usage_label.setText(f"Volume usage: {detail}")
+        else:
+            self._usage_label.setText("Volume usage: idle")
+
+    def on_usage_deferred(self, reason: str) -> None:
+        self._usage_progress_bar.setVisible(False)
+        self._usage_label.setText(f"Volume usage: {reason}")
 
     def on_log_line(self, line: str) -> None:
         self._log_pane.appendPlainText(line)
@@ -236,6 +285,9 @@ class ConnectionWidget(QWidget):
             self._region_combo.setCurrentIndex(idx)
         self._endpoint_edit.setText(profile.endpoint)
         self._volume_edit.setText(profile.volume_id)
+        self._volume_size_edit.setText(
+            str(profile.remote_volume_size) if profile.remote_volume_size > 0 else ""
+        )
         self._access_key_edit.setText(profile.access_key_id)
         if secret:
             self._secret_edit.setText(secret)
@@ -258,6 +310,7 @@ class ConnectionWidget(QWidget):
             volume_id=self._volume_edit.text().strip(),
             access_key_id=self._access_key_edit.text().strip(),
             drive_letter=self._drive_combo.currentText().strip().upper(),
+            remote_volume_size=self._parse_volume_size(),
             file_mode=self._file_mode_edit.text().strip() or "0666",
             dir_mode=self._dir_mode_edit.text().strip() or "0777",
             auto_mount=self._auto_mount_check.isChecked(),
@@ -265,6 +318,12 @@ class ConnectionWidget(QWidget):
 
     def get_secret(self) -> str:
         return self._secret_edit.text()
+
+    def _parse_volume_size(self) -> int:
+        try:
+            return int(self._volume_size_edit.text().strip())
+        except (TypeError, ValueError):
+            return 0
 
     # -- internal slots --
 

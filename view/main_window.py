@@ -73,7 +73,8 @@ class MainWindow(QMainWindow):
         self._suppress_combo = False
         self._connection_widget: Optional[QWidget] = None
         self._connection_window: Optional[QWidget] = None
-        self._log_viewer = None
+        self._log_viewer_widget: Optional[QWidget] = None
+        self._log_viewer_window: Optional[QWidget] = None
         self._log_model = None
 
         self.ui.comboBox_LocalSelectWorkflow.setPlaceholderText("No local workflows")
@@ -175,7 +176,7 @@ class MainWindow(QMainWindow):
         if self._connection_window is None:
             self._connection_window = QWidget()
             self._connection_window.setWindowTitle("Connection Manager")
-            self._connection_window.setMinimumSize(500, 460)
+            self._connection_window.setMinimumSize(500, 500)
             layout = QVBoxLayout(self._connection_window)
             layout.addWidget(self._connection_widget)
         self._connection_window.show()
@@ -183,13 +184,22 @@ class MainWindow(QMainWindow):
         self._connection_window.activateWindow()
 
     def open_log_viewer(self) -> None:
-        from view.log_viewer import LogViewerWindow
+        from view.log_viewer import LogViewerWidget
 
-        if self._log_viewer is None:
-            self._log_viewer = LogViewerWindow(self._log_model, self)
-        self._log_viewer.show()
-        self._log_viewer.raise_()
-        self._log_viewer.activateWindow()
+        if self._log_model is None:
+            QMessageBox.information(self, "Log Viewer", "Log model unavailable.")
+            return
+        if self._log_viewer_window is None:
+            self._log_viewer_window = QWidget(None, Qt.WindowType.Window)
+            self._log_viewer_window.setWindowTitle("Log Viewer")
+            self._log_viewer_window.setMinimumSize(720, 480)
+            layout = QVBoxLayout(self._log_viewer_window)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self._log_viewer_widget = LogViewerWidget(self._log_model)
+            layout.addWidget(self._log_viewer_widget)
+        self._log_viewer_window.show()
+        self._log_viewer_window.raise_()
+        self._log_viewer_window.activateWindow()
 
     # ------------------------------------------------------------- path browse
     def _browse_local_model(self) -> None:
@@ -253,10 +263,15 @@ class MainWindow(QMainWindow):
         if vm.used_bytes is not None and vm.total_space_bytes is not None:
             avail = max(0, vm.total_space_bytes - vm.used_bytes)
             u.label_SpaceUsage.setText(
-                f"Used: [{human_bytes(vm.used_bytes)}] Available: [{human_bytes(avail)}]"
+                f"Used (models): [{human_bytes(vm.used_bytes)}] "
+                f"Available: [{human_bytes(avail)}]"
+            )
+        elif vm.connection_established and vm.used_bytes is None:
+            u.label_SpaceUsage.setText(
+                "Used (models): [(set remote model path)] Available: []"
             )
         else:
-            u.label_SpaceUsage.setText("Used: [] Available: []")
+            u.label_SpaceUsage.setText("Used (models): [] Available: []")
 
     def on_local_workflows_changed(self, items: list[ComboItemVM], active_key: str) -> None:
         self._populate_combo(self.ui.comboBox_LocalSelectWorkflow, items, active_key)

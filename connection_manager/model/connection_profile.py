@@ -40,6 +40,7 @@ class ConnectionProfile:
     volume_id: str
     access_key_id: str
     drive_letter: str
+    remote_volume_size: int = 0  # provisioned volume capacity, in gigabytes
     file_mode: str = "0666"
     dir_mode: str = "0777"
     auto_mount: bool = False
@@ -50,7 +51,13 @@ class ConnectionProfile:
     @classmethod
     def from_dict(cls, data: dict) -> ConnectionProfile:
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in data.items() if k in known_fields})
+        kwargs = {k: v for k, v in data.items() if k in known_fields}
+        if "remote_volume_size" in kwargs:
+            try:
+                kwargs["remote_volume_size"] = int(kwargs["remote_volume_size"])
+            except (TypeError, ValueError):
+                kwargs["remote_volume_size"] = 0
+        return cls(**kwargs)
 
     def validate(self) -> list[str]:
         """Return a list of validation error strings (empty means valid)."""
@@ -71,4 +78,6 @@ class ConnectionProfile:
             errors.append("Endpoint must be a valid URL (e.g. https://s3api-eu-ro-1.runpod.io/).")
         if not self.drive_letter or len(self.drive_letter) != 1 or not self.drive_letter.isalpha():
             errors.append("Drive letter must be a single letter (A-Z).")
+        if not isinstance(self.remote_volume_size, int) or self.remote_volume_size <= 0:
+            errors.append("Remote Volume Size (GB) must be a positive whole number.")
         return errors

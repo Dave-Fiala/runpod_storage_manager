@@ -76,6 +76,11 @@ class ConnectionController(QObject):
     # -- public slots --
 
     def connect_profile(self, profile: ConnectionProfile, secret: str) -> None:
+        # NOTE: Drive mounting (geesefs/WinFsp) is intentionally disabled. The
+        # application talks to the volume exclusively over the S3 API, so we no
+        # longer mount a local drive letter (which slowed the system down). We
+        # still validate the profile/secret and report the connection as
+        # "established" so downstream API services can initialise.
         if self._state in (MountState.MOUNTING, MountState.UNMOUNTING):
             return
 
@@ -88,49 +93,17 @@ class ConnectionController(QObject):
             self._set_state(MountState.ERROR, "Secret Access Key is required")
             return
 
-        drive = f"{profile.drive_letter}:\\"
-        if os.path.exists(drive):
-            self._set_state(
-                MountState.ERROR,
-                f"Drive {profile.drive_letter}: is already in use",
-            )
-            return
-
-        geesefs_path = self._resolve_geesefs_path()
-        if not geesefs_path:
-            self._set_state(
-                MountState.ERROR,
-                "geesefs is not available. Run component check first.",
-            )
-            return
-
         self._active_profile = profile
-        self._set_state(MountState.MOUNTING, f"Mounting {profile.volume_id}...")
-
-        def do_mount() -> str:
-            self._mount_service.mount(
-                profile, geesefs_path, secret,
-                log_callback=self._on_log_line,
-            )
-            return f"Mounted on {profile.drive_letter}:"
-
-        self._run_worker(do_mount, self._on_mount_success, self._on_mount_error)
+        self._set_state(MountState.MOUNTED, f"Connected to {profile.volume_id} (S3 API)")
 
     def disconnect(self) -> None:
+        # Mounting is disabled, so there is no drive/process to tear down; just
+        # reset the connection state.
         if self._state in (MountState.MOUNTING, MountState.UNMOUNTING):
             return
-        if not self._mount_service.is_mounted():
-            self._set_state(MountState.DISCONNECTED)
-            return
-
-        self._set_state(MountState.UNMOUNTING, "Unmounting...")
         self._health_timer.stop()
-
-        def do_unmount() -> str:
-            self._mount_service.unmount()
-            return "Disconnected"
-
-        self._run_worker(do_unmount, self._on_unmount_success, self._on_unmount_error)
+        self._active_profile = None
+        self._set_state(MountState.DISCONNECTED, "Disconnected")
 
     def run_component_check(self) -> None:
         def do_check() -> list[ComponentStatus]:
