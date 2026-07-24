@@ -146,11 +146,6 @@ class WorkspacePool(QObject):
         wf.parsed = True
         wf.parse_error = None
         wf.parsed_signature = signature
-        wf.unresolved_refs = [
-            m.filename
-            for m in self.models_for(workflow_key)
-            if not m.exists_on_local and not m.exists_on_remote
-        ]
         self.workflowUpdated.emit(workflow_key)
 
     def record_parse_error(self, workflow_key: str, error: str) -> None:
@@ -270,6 +265,19 @@ class WorkspacePool(QObject):
             if not present:
                 return False
         return True
+
+    def unresolved_refs(self, workflow_key: str) -> list[str]:
+        """Filenames referenced by the workflow that exist in no location.
+
+        Computed live from current model state (never a stale snapshot), so a
+        model discovered on disk after the workflow was parsed is no longer
+        reported as unresolved.
+        """
+        return [
+            m.filename
+            for m in self.models_for(workflow_key)
+            if not m.exists_on_local and not m.exists_on_remote
+        ]
 
     def missing_models(self, workflow_key: str, location: Location) -> list[Model]:
         result = []

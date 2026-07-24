@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self.ui.comboBox_LocalSelectWorkflow.setPlaceholderText("No local workflows")
         self.ui.comboBox_RemoteSelectWorkflow.setPlaceholderText("Not connected")
         self._setup_trees()
+        self._setup_status_indicators()
         self._inject_cancel_button()
         self._wire_view()
         self.on_enablement_changed(EnablementVM(False, False, False, False, False, False))
@@ -100,6 +101,20 @@ class MainWindow(QMainWindow):
         self.ui.treeWidget_RemoteModelDirectory.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
+
+    def _setup_status_indicators(self) -> None:
+        """Status lamps must be checkable (but read-only) to show a tick when set."""
+        u = self.ui
+        for cb in (
+            u.checkBox_ConnectionEstablished,
+            u.checkBox_DriveMounted,
+            u.checkBox_ExistsOnLocal,
+            u.checkBox_ExistsOnRemote,
+            u.checkBox_ReadyToUseLocal,
+            u.checkBox_ReadyToUseRemote,
+        ):
+            cb.setCheckable(True)
+            cb.setEnabled(False)
 
     def _inject_cancel_button(self) -> None:
         self._cancel_button = QPushButton("Cancel")

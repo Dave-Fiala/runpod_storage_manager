@@ -18,19 +18,42 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Iterator, Optional
 
 import boto3
-from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
+
+# Multipart upload tuning for RunPod's S3 gateway.
+#
+# RunPod fronts its S3 API with Cloudflare, whose ~100s origin-response window
+# surfaces as HTTP 524 on UploadPart when a single part takes too long to commit
+# on the backend. Large parts + high concurrency make that far more likely, so we
+# keep parts small and upload them one at a time, retrying transient failures
+# (524 and the other Cloudflare 52x codes, plus 5xx / connection drops) per part
+# rather than restarting the whole transfer.
+_MULTIPART_THRESHOLD = 16 * _MB  # switch to multipart above this size
+_MULTIPART_PART_SIZE = 16 * _MB  # per-part size; well under RunPod's 500 MB cap
+_MAX_PART_ATTEMPTS = 8           # attempts per part / put / complete
+_RETRY_BASE_DELAY = 2.0          # seconds; exponential backoff base
+_RETRY_MAX_DELAY = 60.0          # seconds; backoff ceiling
+
+# HTTP status codes worth retrying. 520-527 are Cloudflare's edge codes (524 is
+# the origin timeout we actually hit); 500/502/503/504 are ordinary S3 hiccups.
+_RETRYABLE_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527})
 
 
 class RemoteStorageError(Exception):
@@ -144,28 +167,92 @@ class RemoteStorageService:
         progress_cb: Optional[Callable[[int], None]] = None,
         cancel_token=None,
     ) -> None:
-        """Upload with automatic multipart. ``progress_cb`` receives the number
-        of bytes transferred *since the last call* (incremental)."""
-        transfer = TransferConfig(
-            multipart_threshold=64 * _MB,
-            multipart_chunksize=128 * _MB,  # comfortably under RunPod's 500 MB part cap
-            max_concurrency=4,
-            use_threads=True,
+        """Upload a file to ``key``.
+
+        Small files go via a single ``PutObject``; larger files use explicit
+        multipart with small parts uploaded one at a time and retried per part.
+        ``progress_cb`` receives the number of bytes transferred *since the last
+        call* (incremental)."""
+        size = os.path.getsize(local_path)
+        if size < _MULTIPART_THRESHOLD:
+            self._upload_single(local_path, key, size, progress_cb, cancel_token)
+        else:
+            self._upload_multipart(local_path, key, progress_cb, cancel_token)
+
+    def _upload_single(
+        self,
+        local_path: str,
+        key: str,
+        size: int,
+        progress_cb: Optional[Callable[[int], None]],
+        cancel_token,
+    ) -> None:
+        self._check_cancelled(cancel_token, key)
+        with open(local_path, "rb") as fh:
+            body = fh.read()
+        self._retry(
+            f"PutObject {key}",
+            lambda: self._client.put_object(Bucket=self._bucket, Key=key, Body=body),
         )
+        if progress_cb is not None:
+            progress_cb(size)
 
-        def _callback(bytes_amount: int) -> None:
-            if cancel_token is not None and cancel_token.cancelled:
-                raise TransferCancelled(f"Cancelled during upload of {key}")
-            if progress_cb is not None:
-                progress_cb(bytes_amount)
-
+    def _upload_multipart(
+        self,
+        local_path: str,
+        key: str,
+        progress_cb: Optional[Callable[[int], None]],
+        cancel_token,
+    ) -> None:
+        self._check_cancelled(cancel_token, key)
+        mpu = self._retry(
+            f"CreateMultipartUpload {key}",
+            lambda: self._client.create_multipart_upload(Bucket=self._bucket, Key=key),
+        )
+        upload_id = mpu["UploadId"]
+        parts: list[dict] = []
         try:
-            self._client.upload_file(local_path, self._bucket, key,
-                                     Config=transfer, Callback=_callback)
-        except TransferCancelled:
+            with open(local_path, "rb") as fh:
+                part_number = 1
+                while True:
+                    self._check_cancelled(cancel_token, key)
+                    chunk = fh.read(_MULTIPART_PART_SIZE)
+                    if not chunk:
+                        break
+                    resp = self._retry(
+                        f"UploadPart {part_number} of {key}",
+                        lambda c=chunk, p=part_number: self._client.upload_part(
+                            Bucket=self._bucket,
+                            Key=key,
+                            PartNumber=p,
+                            UploadId=upload_id,
+                            Body=c,
+                        ),
+                    )
+                    parts.append({"ETag": resp["ETag"], "PartNumber": part_number})
+                    if progress_cb is not None:
+                        progress_cb(len(chunk))
+                    part_number += 1
+            self._retry(
+                f"CompleteMultipartUpload {key}",
+                lambda: self._client.complete_multipart_upload(
+                    Bucket=self._bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                ),
+            )
+        except BaseException:
+            # Always abort on any failure or cancellation: in-flight parts live in
+            # a hidden .s3compat_uploads/ dir and otherwise silently consume the
+            # volume's fixed capacity until aborted.
+            try:
+                self._client.abort_multipart_upload(
+                    Bucket=self._bucket, Key=key, UploadId=upload_id
+                )
+            except Exception:
+                logger.warning("Failed to abort multipart upload for %s", key)
             raise
-        except ClientError as exc:
-            raise self._auth_or_generic(exc) from exc
 
     # ----------------------------------------------------------------- delete
     def delete_object(self, key: str) -> None:
@@ -195,6 +282,55 @@ class RemoteStorageService:
         return None
 
     # -------------------------------------------------------------- internals
+    @staticmethod
+    def _check_cancelled(cancel_token, key: str) -> None:
+        if cancel_token is not None and cancel_token.cancelled:
+            raise TransferCancelled(f"Cancelled during upload of {key}")
+
+    @staticmethod
+    def _http_status(exc: ClientError) -> Optional[int]:
+        try:
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status is not None:
+                return int(status)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        # Some gateways only populate Error.Code with the numeric status.
+        try:
+            return int(exc.response.get("Error", {}).get("Code", ""))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _retry(self, op_desc: str, fn: Callable):
+        """Run ``fn`` with backoff on transient RunPod/Cloudflare failures.
+
+        Auth errors are never retried; non-retryable client errors surface
+        immediately. Used for each multipart part so one slow part (524) does
+        not restart the whole upload."""
+        delay = _RETRY_BASE_DELAY
+        for attempt in range(1, _MAX_PART_ATTEMPTS + 1):
+            try:
+                return fn()
+            except ClientError as exc:
+                if self._is_auth_error(exc):
+                    raise self._auth_or_generic(exc) from exc
+                status = self._http_status(exc)
+                if attempt >= _MAX_PART_ATTEMPTS or status not in _RETRYABLE_STATUS:
+                    raise RemoteStorageError(f"{op_desc} failed: {exc}") from exc
+                logger.warning(
+                    "%s: HTTP %s (attempt %d/%d), retrying in %.0fs",
+                    op_desc, status, attempt, _MAX_PART_ATTEMPTS, delay,
+                )
+            except (EndpointConnectionError, ConnectionClosedError, ReadTimeoutError) as exc:
+                if attempt >= _MAX_PART_ATTEMPTS:
+                    raise RemoteStorageError(f"{op_desc} failed: {exc}") from exc
+                logger.warning(
+                    "%s: %s (attempt %d/%d), retrying in %.0fs",
+                    op_desc, type(exc).__name__, attempt, _MAX_PART_ATTEMPTS, delay,
+                )
+            time.sleep(delay)
+            delay = min(delay * 2, _RETRY_MAX_DELAY)
+
     @staticmethod
     def _is_auth_error(exc: ClientError) -> bool:
         code = exc.response.get("Error", {}).get("Code", "")

@@ -98,7 +98,6 @@ class Workflow:
     # source signature (mtime/etag) of the copy last parsed, so re-scans can
     # skip re-parsing unchanged files.
     parsed_signature: Optional[str] = None
-    unresolved_refs: list[str] = field(default_factory=list)
 
     # -- relationships -------------------------------------------------------
     model_keys: set[str] = field(default_factory=set)

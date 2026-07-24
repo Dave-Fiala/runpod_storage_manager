@@ -121,7 +121,7 @@ class SyncController(QObject):
         self._usage_timer.timeout.connect(self._refresh_remote_usage)
 
         # Wire job runner signals through to the view.
-        self._jobs.jobProgress.connect(self.jobProgress)
+        self._jobs.jobProgress.connect(self._on_job_progress)
         self._jobs.jobStarted.connect(self._on_job_started)
         self._jobs.jobStatus.connect(self._on_job_status)
         self._jobs.jobLog.connect(lambda msg: self._log.add_line(msg, source="sync"))
@@ -324,10 +324,15 @@ class SyncController(QObject):
         from connection_manager.model.mount_state import MountState
 
         if state == MountState.MOUNTED:
+            self._log.add("INFO", "sync", f"Connection manager connected{f': {detail}' if detail else ''}")
             self._drive_name = self._active_profile_name()
             self._drive_letter = self._active_drive_letter()
             self._build_remote_service()
         elif state in (MountState.DISCONNECTED, MountState.ERROR):
+            if state == MountState.DISCONNECTED:
+                self._log.add("INFO", "sync", "Connection manager disconnected")
+            elif detail:
+                self._log.add("ERROR", "sync", f"Connection manager error: {detail}")
             self._teardown_remote_service()
             self._drive_letter = None
         self._emit_connection_status(drive_mounted=(state == MountState.MOUNTED))
@@ -336,6 +341,7 @@ class SyncController(QObject):
     def _build_remote_service(self) -> None:
         profile = self._active_profile()
         if profile is None or self._conn is None:
+            self._log.add("WARNING", "sync", "Cannot build remote service — no active profile")
             return
         secret = self._conn.load_secret(profile.name) or ""
         if not secret:
@@ -344,6 +350,10 @@ class SyncController(QObject):
         try:
             from services.remote_storage import RemoteStorageService
 
+            self._log.add(
+                "INFO", "sync",
+                f"Building S3 client for volume '{profile.volume_id}' at {profile.endpoint}",
+            )
             self._remote = RemoteStorageService(profile, secret)
         except Exception as exc:  # noqa: BLE001
             self._log.add("ERROR", "sync", f"Could not build S3 client: {exc}")
@@ -357,6 +367,7 @@ class SyncController(QObject):
             self._remote.probe()
             return True
 
+        self._log.add("INFO", "sync", "Submitting S3 probe (head_bucket)")
         self._jobs.submit(Job(kind="probe", fn=job, description="S3 probe", silent=True))
 
     def _teardown_remote_service(self) -> None:
@@ -390,12 +401,14 @@ class SyncController(QObject):
             return
         prefix = self._usage_prefix()
         if not prefix:
-            self.usageScanDeferred.emit(
-                "Set the remote model path on the main window to calculate usage."
-            )
+            reason = "Set the remote model path on the main window to calculate usage."
+            self.usageScanDeferred.emit(reason)
+            self._log.add("INFO", "sync", f"Usage scan deferred: {reason}")
             return
         if self._usage_scan_pending:
-            self.usageScanDeferred.emit("Usage scan already in progress.")
+            reason = "Usage scan already in progress."
+            self.usageScanDeferred.emit(reason)
+            self._log.add("INFO", "sync", reason)
             return
         self._start_usage_scan()
 
@@ -405,20 +418,22 @@ class SyncController(QObject):
             return
         prefix = self._usage_prefix()
         if not prefix:
-            self.usageScanDeferred.emit(
-                "Set the remote model path on the main window to calculate usage."
-            )
+            reason = "Set the remote model path on the main window to calculate usage."
+            self.usageScanDeferred.emit(reason)
+            self._log.add("INFO", "sync", f"Usage scan deferred: {reason}")
             return
         if self._usage_scan_pending:
             return
 
         self._usage_scan_pending = True
         capacity = self._profile_capacity_bytes()
+        self._log.add("INFO", "sync", f"Starting usage scan for prefix '{prefix}'")
         self.usageScanStarted.emit(prefix)
 
         def job(ctx):
             def progress_cb(count: int, message: str) -> None:
                 self.usageScanProgress.emit(count, message)
+                self._log.add("INFO", "sync", message)
 
             used, _count = self._remote.bucket_usage(
                 prefix, progress_cb=progress_cb,
@@ -447,7 +462,7 @@ class SyncController(QObject):
             uploads=tuple(TransferItemVM(i.display_name, i.size_bytes) for i in plan.uploads),
             skip_count=len(plan.skips),
             total_bytes=plan.total_bytes,
-            unresolved_refs=tuple(wf.unresolved_refs) if wf else (),
+            unresolved_refs=tuple(self._pool.unresolved_refs(key)) if wf else (),
             projected_label=projected_label,
             over_capacity=over,
         )
@@ -552,29 +567,46 @@ class SyncController(QObject):
             logger.exception("Reveal failed for %s", path)
 
     # ================================================================ job hooks
+    def _log_operation(self, message: str, level: str = "INFO") -> None:
+        """Update the main-window operation label and mirror to the log viewer."""
+        self.currentOperation.emit(message)
+        if message and message != "Idle":
+            self._log.add(level, "sync", message)
+
     def _on_job_started(self, kind: str, description: str) -> None:
         self._active_job_kind = kind
+        if description:
+            self._log.add("INFO", "sync", f"Job started ({kind}): {description}")
         self.jobStarted.emit(kind, description)
+
+    def _on_job_progress(self, done: int, total: int, message: str) -> None:
+        self.jobProgress.emit(done, total, message)
+        if message:
+            self._log.add("INFO", "sync", message)
 
     def _on_job_status(self, message: str) -> None:
         # Usage scan progress is shown in the Connection Manager, not the main window.
         if self._active_job_kind == "usage":
+            if message:
+                self._log.add("INFO", "sync", message)
             return
-        self.currentOperation.emit(message)
+        self._log_operation(message)
 
     def _on_job_finished(self, kind: str, result) -> None:
         self._active_job_kind = ""
         if kind == "probe":
             self._connected = True
             self._remote_total_bytes = self._profile_capacity_bytes()
-            self.currentOperation.emit("Idle")
-            self._log.add("INFO", "sync", "S3 connection verified.")
+            self._log_operation("Idle")
+            self._log.add("INFO", "sync", "S3 connection verified — remote API ready")
             self._emit_connection_status(drive_mounted=True)
             self._usage_timer.start()
             data = self._config.data
             if data.remote_model_prefix:
+                self._log.add("INFO", "sync", f"Auto-refreshing remote models at '{data.remote_model_prefix}'")
                 self._start_remote_models_refresh(data.remote_model_prefix)
             if data.remote_workflow_prefix:
+                self._log.add("INFO", "sync", f"Auto-refreshing remote workflows at '{data.remote_workflow_prefix}'")
                 self._start_remote_workflows_refresh(data.remote_workflow_prefix)
             self._start_usage_scan()
         elif kind == "usage" and isinstance(result, dict):
@@ -582,13 +614,19 @@ class SyncController(QObject):
             self._remote_used_bytes = result.get("used")
             self._remote_total_bytes = result.get("total")
             used_label = human_bytes(self._remote_used_bytes)
+            self._log.add("INFO", "sync", f"Usage scan complete: {used_label} in models prefix")
             self.usageScanFinished.emit(True, f"{used_label} used in models prefix")
             self._emit_connection_status(drive_mounted=True)
         elif kind in ("sync", "remove"):
             report = result if isinstance(result, JobReportVM) else JobReportVM(kind, 0, (), "")
+            if report.failures:
+                self._log.add("WARNING", "sync", f"{kind} finished with {len(report.failures)} failure(s)")
+            else:
+                self._log.add("INFO", "sync", f"{kind} finished successfully")
             self.jobFinished.emit(report)
             self._refresh_remote_usage()
         elif kind == "refresh":
+            self._log.add("INFO", "sync", "Refresh job finished")
             self.jobFinished.emit(JobReportVM(kind, 0, (), ""))
         self._emit_all()
 
@@ -598,7 +636,7 @@ class SyncController(QObject):
             self._log.add("ERROR", "sync", f"S3 probe failed: {error}")
             self._teardown_remote_service()
             self._drive_letter = None
-            self.currentOperation.emit("Idle")
+            self._log_operation("Idle")
             self.jobFinished.emit(JobReportVM(kind, 0, ((kind, error),), error))
             self._emit_connection_status(drive_mounted=False)
             self._emit_all()
@@ -721,7 +759,7 @@ class SyncController(QObject):
             projected_label=projected_label,
             projected_percent=pct,
             projected_warn_level=level,
-            unresolved_refs=tuple(wf.unresolved_refs),
+            unresolved_refs=tuple(self._pool.unresolved_refs(self._active_key)),
         )
         self.workflowStatusChanged.emit(vm)
 

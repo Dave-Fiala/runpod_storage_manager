@@ -84,16 +84,25 @@ class ConnectionController(QObject):
         if self._state in (MountState.MOUNTING, MountState.UNMOUNTING):
             return
 
+        self.logLine.emit(
+            f"Connect requested for profile '{profile.name}' "
+            f"(volume {profile.volume_id}, {profile.region})"
+        )
+
         errors = profile.validate()
         if errors:
-            self._set_state(MountState.ERROR, "; ".join(errors))
+            detail = "; ".join(errors)
+            self.logLine.emit(f"Profile validation failed: {detail}")
+            self._set_state(MountState.ERROR, detail)
             return
 
         if not secret:
+            self.logLine.emit("Connect failed: Secret Access Key is required")
             self._set_state(MountState.ERROR, "Secret Access Key is required")
             return
 
         self._active_profile = profile
+        self.logLine.emit(f"Profile '{profile.name}' validated — opening S3 API session")
         self._set_state(MountState.MOUNTED, f"Connected to {profile.volume_id} (S3 API)")
 
     def disconnect(self) -> None:
@@ -101,9 +110,14 @@ class ConnectionController(QObject):
         # reset the connection state.
         if self._state in (MountState.MOUNTING, MountState.UNMOUNTING):
             return
+        was_connected = self._state == MountState.MOUNTED
+        if was_connected:
+            self.logLine.emit("Disconnect requested")
         self._health_timer.stop()
         self._active_profile = None
         self._set_state(MountState.DISCONNECTED, "Disconnected")
+        if was_connected:
+            self.logLine.emit("Disconnected")
 
     def run_component_check(self) -> None:
         def do_check() -> list[ComponentStatus]:

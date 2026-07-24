@@ -99,6 +99,68 @@ def test_bucket_usage_respects_prefix_and_progress():
 
 
 @mock_aws
+def test_upload_multipart_splits_into_parts(tmp_path, monkeypatch):
+    import services.remote_storage as rs
+
+    part = 5 * 1024 * 1024  # moto enforces the 5 MB minimum on non-final parts
+    monkeypatch.setattr(rs, "_MULTIPART_THRESHOLD", part)
+    monkeypatch.setattr(rs, "_MULTIPART_PART_SIZE", part)
+
+    client = _make_bucket()
+    svc = RemoteStorageService(FakeProfile(), "rps_test")
+
+    payload = b"z" * (part + 1000)  # -> two parts: 5 MB + 1000 B
+    local = tmp_path / "big.bin"
+    local.write_bytes(payload)
+
+    progress: list[int] = []
+    svc.upload_file(str(local), "models/big.bin", progress_cb=progress.append)
+
+    assert len(progress) == 2
+    assert sum(progress) == len(payload)
+    body = client.get_object(Bucket=_BUCKET, Key="models/big.bin")["Body"].read()
+    assert body == payload
+
+
+@mock_aws
+def test_upload_part_retries_on_524(tmp_path, monkeypatch):
+    import services.remote_storage as rs
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setattr(rs, "_MULTIPART_THRESHOLD", 1024)
+    monkeypatch.setattr(rs, "_MULTIPART_PART_SIZE", 1 * 1024 * 1024)  # one part
+    monkeypatch.setattr(rs, "_RETRY_BASE_DELAY", 0.0)  # no real backoff sleeps
+
+    _make_bucket()
+    svc = RemoteStorageService(FakeProfile(), "rps_test")
+
+    real_upload_part = svc._client.upload_part
+    calls = {"n": 0}
+
+    def flaky_upload_part(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ClientError(
+                {"Error": {"Code": "524", "Message": "origin timeout"},
+                 "ResponseMetadata": {"HTTPStatusCode": 524}},
+                "UploadPart",
+            )
+        return real_upload_part(**kwargs)
+
+    monkeypatch.setattr(svc._client, "upload_part", flaky_upload_part)
+
+    payload = b"w" * 2048
+    local = tmp_path / "flaky.bin"
+    local.write_bytes(payload)
+
+    svc.upload_file(str(local), "models/flaky.bin")
+
+    assert calls["n"] == 2  # failed once, retried, succeeded
+    body = svc.head_object("models/flaky.bin")
+    assert body is not None
+
+
+@mock_aws
 def test_list_skips_directory_markers():
     client = _make_bucket()
     svc = RemoteStorageService(FakeProfile(), "rps_test")
